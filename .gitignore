@@ -1,0 +1,11 @@
+# Ignorar pasta node_modules
+node_modules/
+
+# Ignorar arquivos de log
+*.log
+
+# Ignorar arquivos temporários
+*.tmp
+
+# Ignorar arquivos do sistema
+.DS_Store
