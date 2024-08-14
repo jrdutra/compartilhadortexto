@@ -2,14 +2,13 @@ const io = require('socket.io-client');
 
 // Substitua a URL pelo endereço do seu servidor Socket.io
 //const socket = io('http://localhost:3000');
-const socket = io('https://compartilhadortexto-fuf5efeqfjhybte3.brazilsouth-01.azurewebsites.net');
+const socket = io('https://compartilhadortexto-fuf5efeqfjhybte3.brazilsouth-01.azurewebsites.net', {
+  rejectUnauthorized: false
+});
 
 // Evento acionado quando a conexão for estabelecida
 socket.on('connect', () => {
   console.log('Conectado ao servidor Socket.io');
-
-  // Enviar uma atualização da variável global
-  socket.emit('updateGlobalVariable', 'novo valor');
 });
 
 // Evento acionado quando a variável global for atualizada
