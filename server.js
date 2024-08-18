@@ -17,6 +17,9 @@ app.get('/healthcheck', (req, res) => {
   });
 });
 
+// Configurar CORS para Socket.IO
+io.origins('*');
+
 io.on('connection', (socket) => {
   console.log('Um cliente se conectou');
 
