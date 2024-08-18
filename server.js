@@ -1,7 +1,6 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
-const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
@@ -36,7 +35,6 @@ io.on('connection', (socket) => {
 
   // Receber atualização da variável global do cliente
   socket.on('updateTextoGlobal', (newValue) => {
-    console.log('Recebeu: ', newValue);
     textoGlobal = newValue;
     io.emit('update', textoGlobal); // Atualiza todos os clientes conectados
   });
