@@ -7,7 +7,7 @@ const server = http.createServer(app);
 const io = socketIo(server);
 const PORT = process.env.PORT || 3000;
 
-let globalVariable = 'valor inicial';
+let textoGlobal = '';
 
 // Endpoint de healthcheck
 app.get('/healthcheck', (req, res) => {
@@ -21,13 +21,13 @@ io.on('connection', (socket) => {
   console.log('Um cliente se conectou');
 
   // Enviar a variável global para o cliente ao conectar
-  socket.emit('update', globalVariable);
+  socket.emit('update', textoGlobal);
 
   // Receber atualização da variável global do cliente
-  socket.on('updateGlobalVariable', (newValue) => {
+  socket.on('updateTextoGlobal', (newValue) => {
     console.log('Recebeu: ', newValue);
     globalVariable = newValue;
-    io.emit('update', globalVariable); // Atualiza todos os clientes conectados
+    io.emit('update', textoGlobal); // Atualiza todos os clientes conectados
   });
 
   socket.on('disconnect', () => {

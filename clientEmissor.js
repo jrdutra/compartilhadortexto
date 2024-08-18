@@ -15,7 +15,7 @@ var i = 0;
 setInterval(() => {
   i++;
   console.log('Enviou o valor ', i);
-  socket.emit('updateGlobalVariable', i);
+  socket.emit('updateTextoGlobal', i);
 }, 1000);
 
 // Evento acionado quando a conexão for fechada
