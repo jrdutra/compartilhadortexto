@@ -1,10 +1,10 @@
 const io = require('socket.io-client');
 
 // Substitua a URL pelo endereço do seu servidor Socket.io
-//const socket = io('http://localhost:3000');
-const socket = io('https://compartilhadortexto-fuf5efeqfjhybte3.brazilsouth-01.azurewebsites.net', {
-  rejectUnauthorized: false
-});
+const socket = io('http://localhost:3000');
+//const socket = io('https://compartilhadortexto-fuf5efeqfjhybte3.brazilsouth-01.azurewebsites.net', {
+ // rejectUnauthorized: false
+//});
 
 // Evento acionado quando a conexão for estabelecida
 socket.on('connect', () => {
