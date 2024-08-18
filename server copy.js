@@ -9,6 +9,17 @@ const PORT = process.env.PORT || 3000;
 
 let textoGlobal = '';
 
+// Endpoint de healthcheck
+app.get('/healthcheck', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Configurar CORS para Socket.IO
+io.origins('*');
+
 io.on('connection', (socket) => {
   console.log('Um cliente se conectou');
 
