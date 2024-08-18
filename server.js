@@ -26,7 +26,7 @@ io.on('connection', (socket) => {
   // Receber atualização da variável global do cliente
   socket.on('updateTextoGlobal', (newValue) => {
     console.log('Recebeu: ', newValue);
-    globalVariable = newValue;
+    textoGlobal = newValue;
     io.emit('update', textoGlobal); // Atualiza todos os clientes conectados
   });
 
