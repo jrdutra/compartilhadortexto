@@ -22,25 +22,69 @@ app.use((req, res, next) => {
   next();
 });
 
-//const io = socketIo(server);
 const PORT = process.env.PORT || 3000;
 
-let textoGlobal = '';
+// Texto atual por canal
+const textosPorCanal = {};
+
+// Contagem de clientes por canal
+const clientesPorCanal = {};
+
+function emitirInfoCanal(canal) {
+  const conectados = clientesPorCanal[canal] ? clientesPorCanal[canal].size : 0;
+  io.to(canal).emit('canalInfo', { conectados });
+}
 
 io.on('connection', (socket) => {
-  console.log('Um cliente se conectou');
+  console.log('Um cliente se conectou:', socket.id);
 
-  // Enviar a variável global para o cliente ao conectar
-  socket.emit('update', textoGlobal);
+  let canalAtual = null;
 
-  // Receber atualização da variável global do cliente
-  socket.on('updateTextoGlobal', (newValue) => {
-    textoGlobal = newValue;
-    io.emit('update', textoGlobal); // Atualiza todos os clientes conectados
+  // Cliente entra em um canal
+  socket.on('joinCanal', (canal) => {
+    if (!canal || typeof canal !== 'string') return;
+
+    // Sair do canal anterior
+    if (canalAtual) {
+      socket.leave(canalAtual);
+      if (clientesPorCanal[canalAtual]) {
+        clientesPorCanal[canalAtual].delete(socket.id);
+        emitirInfoCanal(canalAtual);
+      }
+    }
+
+    canalAtual = canal.trim();
+    socket.join(canalAtual);
+
+    if (!clientesPorCanal[canalAtual]) {
+      clientesPorCanal[canalAtual] = new Set();
+    }
+    clientesPorCanal[canalAtual].add(socket.id);
+
+    // Enviar texto atual do canal para o cliente que entrou
+    socket.emit('update', textosPorCanal[canalAtual] || '');
+
+    // Notificar todos no canal sobre nova contagem
+    emitirInfoCanal(canalAtual);
+
+    console.log(`Cliente ${socket.id} entrou no canal "${canalAtual}" (${clientesPorCanal[canalAtual].size} conectado(s))`);
+  });
+
+  // Receber atualização de texto do cliente
+  socket.on('updateTextoGlobal', ({ canal, texto }) => {
+    if (!canal || typeof canal !== 'string') return;
+    textosPorCanal[canal.trim()] = texto;
+    // Transmitir para todos no canal, exceto o remetente
+    socket.to(canal.trim()).emit('update', texto);
   });
 
   socket.on('disconnect', () => {
-    console.log('Um cliente se desconectou');
+    console.log('Um cliente se desconectou:', socket.id);
+    if (canalAtual && clientesPorCanal[canalAtual]) {
+      clientesPorCanal[canalAtual].delete(socket.id);
+      emitirInfoCanal(canalAtual);
+      console.log(`Canal "${canalAtual}" agora tem ${clientesPorCanal[canalAtual].size} conectado(s)`);
+    }
   });
 });
 
