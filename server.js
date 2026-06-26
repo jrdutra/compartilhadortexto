@@ -28,21 +28,22 @@ const MAX_HISTORICO     = 100;
 
 // Rate limits
 const LIMITE_SOCKET_CANAIS = 20;
-const JANELA_SOCKET_MS     = 5  * 60 * 1000;  // 5 min por socket
+const JANELA_SOCKET_MS     = 5  * 60 * 1000;
 const LIMITE_GRUPO_CANAIS  = 100;
-const JANELA_GRUPO_MS      = 10 * 60 * 1000;  // 10 min por grupo
+const JANELA_GRUPO_MS      = 10 * 60 * 1000;
 
 const textos    = {};   // textos[grupo][canal] = string
 const clientes  = {};   // clientes[grupo][canal] = Set<socketId>
-const timers    = {};   // timers[grupo][canal] = timeoutId (grace period)
+const timers    = {};   // timers[grupo][canal] = timeoutId
 const historico = {};   // historico[grupo][canal] = [ISO, ...]
-const debounceHist = {}; // debounceHist[grupo][canal] = timeoutId
+const debounceHist = {};
 const donos     = {};   // donos[grupo] = socketId (admin)
+const ocultados = {};   // ocultados[grupo][canal] = true|false
 
 // Rate limiting
-const banidos           = new Set();  // socketIds banidos
-const criacoesPorSocket = {};         // socketId -> [timestamp, ...]
-const criacoesPorGrupo  = {};         // grupo -> [{canal, timestamp}, ...]
+const banidos           = new Set();
+const criacoesPorSocket = {};
+const criacoesPorGrupo  = {};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -63,6 +64,10 @@ function todosSocketsDoGrupo(grupo, exceto = null) {
     }
   }
   return ids;
+}
+
+function isCanalOculto(grupo, canal) {
+  return !!(ocultados[grupo]?.[canal]);
 }
 
 // ─── Admin ──────────────────────────────────────────────────────────────────
@@ -105,6 +110,11 @@ function limparCanal(grupo, canal) {
       if (!Object.keys(obj[grupo]).length) delete obj[grupo];
     }
   }
+  // Limpar visibilidade do canal
+  if (ocultados[grupo]) {
+    delete ocultados[grupo][canal];
+    if (!Object.keys(ocultados[grupo]).length) delete ocultados[grupo];
+  }
 }
 
 // ─── Rate limiting ───────────────────────────────────────────────────────────
@@ -113,10 +123,8 @@ function registrarCriacaoCanal(socketId, grupo, canal) {
   const agora = Date.now();
   const isAdminDoGrupo = donos[grupo] === socketId;
 
-  // ── Limite por socket (não-admins) ──────────────────────────────────────
   if (!isAdminDoGrupo) {
     if (!criacoesPorSocket[socketId]) criacoesPorSocket[socketId] = [];
-    // Limpar entradas fora da janela
     criacoesPorSocket[socketId] = criacoesPorSocket[socketId].filter(t => agora - t < JANELA_SOCKET_MS);
     criacoesPorSocket[socketId].push(agora);
 
@@ -133,7 +141,6 @@ function registrarCriacaoCanal(socketId, grupo, canal) {
     }
   }
 
-  // ── Limite por grupo ────────────────────────────────────────────────────
   if (!criacoesPorGrupo[grupo]) criacoesPorGrupo[grupo] = [];
   criacoesPorGrupo[grupo] = criacoesPorGrupo[grupo].filter(e => agora - e.timestamp < JANELA_GRUPO_MS);
   criacoesPorGrupo[grupo].push({ canal, timestamp: agora });
@@ -188,23 +195,30 @@ function agendarHistorico(grupo, canal) {
   }, DEBOUNCE_HIST_MS);
 }
 
-// ─── Diretório ───────────────────────────────────────────────────────────────
+// ─── Diretório personalizado por socket ──────────────────────────────────────
 
 function emitirInfoCanal(grupo, canal) {
   io.to(chaveRoom(grupo, canal)).emit('canalInfo', { conectados: getConectados(grupo, canal) });
 }
 
-function buildDiretorio() {
+// Admin recebe todos os canais; não-admin recebe apenas os visíveis
+function buildDiretorioParaSocket(socketId) {
   const dir = {};
   const grupos = new Set([...Object.keys(clientes), ...Object.keys(timers)]);
   for (const grupo of grupos) {
-    const canais = getCanaisDoGrupo(grupo);
+    const isAdminDoGrupo = donos[grupo] === socketId;
+    const canais = getCanaisDoGrupo(grupo)
+      .filter(c => isAdminDoGrupo || !isCanalOculto(grupo, c));
     if (canais.length) dir[grupo] = canais;
   }
   return dir;
 }
 
-function emitirDiretorio() { io.emit('diretorioAtualizado', buildDiretorio()); }
+function emitirDiretorio() {
+  for (const [socketId, sock] of io.sockets.sockets) {
+    sock.emit('diretorioAtualizado', buildDiretorioParaSocket(socketId));
+  }
+}
 
 // ─── Socket ──────────────────────────────────────────────────────────────────
 
@@ -214,7 +228,8 @@ io.on('connection', (socket) => {
   let grupoAtual = null;
   let canalAtual = null;
 
-  socket.emit('diretorioAtualizado', buildDiretorio());
+  // Diretório personalizado no momento da conexão
+  socket.emit('diretorioAtualizado', buildDiretorioParaSocket(socket.id));
 
   // ── joinCanal ────────────────────────────────────────────────────────────
   socket.on('joinCanal', ({ grupo, canal }) => {
@@ -222,16 +237,13 @@ io.on('connection', (socket) => {
     const g = grupo.trim(), c = canal.trim();
     if (!g || !c) return;
 
-    // Verificar ban
     if (banidos.has(socket.id)) {
       socket.emit('banido', { motivo: 'Sessão bloqueada por criação excessiva de canais.' });
       return;
     }
 
-    // Verificar se é um canal novo (antes de qualquer alteração)
     const canalNovo = !getCanaisDoGrupo(g).includes(c);
 
-    // Sair do canal anterior
     if (grupoAtual && canalAtual) {
       socket.leave(chaveRoom(grupoAtual, canalAtual));
       if (clientes[grupoAtual]?.[canalAtual]) {
@@ -239,7 +251,6 @@ io.on('connection', (socket) => {
         emitirInfoCanal(grupoAtual, canalAtual);
         if (getConectados(grupoAtual, canalAtual) === 0) agendarLimpeza(grupoAtual, canalAtual);
       }
-      // Se mudou de grupo, transferir admin do grupo anterior
       if (grupoAtual !== g && donos[grupoAtual] === socket.id) {
         transferirAdmin(grupoAtual, socket.id);
         socket.emit('adminStatus', { isAdmin: false, grupo: grupoAtual });
@@ -247,7 +258,6 @@ io.on('connection', (socket) => {
       emitirDiretorio();
     }
 
-    // Rate limiting para canais novos
     if (canalNovo) {
       const resultado = registrarCriacaoCanal(socket.id, g, c);
       if (resultado === 'banido' || resultado === 'spam_grupo') return;
@@ -267,13 +277,19 @@ io.on('connection', (socket) => {
     emitirInfoCanal(g, c);
     emitirDiretorio();
 
-    // Admin: primeiro a entrar no grupo torna-se dono
     if (!donos[g]) {
       atribuirAdmin(g, socket.id);
     } else if (donos[g] === socket.id) {
       socket.emit('adminStatus', { isAdmin: true, grupo: g });
     } else {
       socket.emit('adminStatus', { isAdmin: false, grupo: g });
+    }
+
+    // Sincronizar estado de visibilidade dos canais do grupo para quem entrou
+    if (ocultados[g]) {
+      for (const [c2, oculto] of Object.entries(ocultados[g])) {
+        if (oculto) socket.emit('visibilidadeCanal', { grupo: g, canal: c2, oculto: true });
+      }
     }
 
     console.log(`${socket.id} entrou em "${g}/${c}" (${clientes[g][c].size} conectado(s))`);
@@ -292,12 +308,33 @@ io.on('connection', (socket) => {
     agendarHistorico(g, c);
   });
 
+  // ── toggleVisibilidadeCanal ──────────────────────────────────────────────
+  socket.on('toggleVisibilidadeCanal', ({ grupo, canal }) => {
+    if (typeof grupo !== 'string' || typeof canal !== 'string') return;
+    const g = grupo.trim(), c = canal.trim();
+    if (!g || !c) return;
+    if (donos[g] !== socket.id) return; // somente admin
+
+    if (!ocultados[g]) ocultados[g] = {};
+    ocultados[g][c] = !ocultados[g][c];
+    const oculto = !!ocultados[g][c];
+
+    // Notificar todos os sockets conectados ao grupo
+    for (const canalGrupo of Object.keys(clientes[g] ?? {})) {
+      io.to(chaveRoom(g, canalGrupo)).emit('visibilidadeCanal', { grupo: g, canal: c, oculto });
+    }
+
+    // Atualizar diretório personalizado (não-admin não vê mais o canal oculto)
+    emitirDiretorio();
+    console.log(`Admin ${oculto ? 'ocultou' : 'exibiu'} canal "${g}/${c}"`);
+  });
+
   // ── excluirCanal ─────────────────────────────────────────────────────────
   socket.on('excluirCanal', ({ grupo, canal }) => {
     if (typeof grupo !== 'string' || typeof canal !== 'string') return;
     const g = grupo.trim(), c = canal.trim();
     if (!g || !c) return;
-    if (donos[g] !== socket.id) return; // somente admin
+    if (donos[g] !== socket.id) return;
 
     const canaisRestantes = getCanaisDoGrupo(g).filter(x => x !== c);
     io.to(chaveRoom(g, c)).emit('canalExcluido', { grupo: g, canal: c, canaisRestantes });
@@ -313,14 +350,14 @@ io.on('connection', (socket) => {
     if (typeof grupo !== 'string') return;
     const g = grupo.trim();
     if (!g) return;
-    if (donos[g] !== socket.id) return; // somente admin
+    if (donos[g] !== socket.id) return;
 
-    // Notificar todos os canais do grupo
-    for (const c of getCanaisDoGrupo(g)) {
-      io.to(chaveRoom(g, c)).emit('grupoExcluido', { grupo: g });
-    }
+    // Notificar TODOS os sockets conectados — não apenas os que estão em rooms do grupo.
+    // Sockets que tinham o grupo selecionado no combobox (sem estar numa room) também
+    // precisam receber o evento para limpar o estado, caso contrário ao interagirem
+    // entrariam no grupo deletado e virariam admin.
+    io.emit('grupoExcluido', { grupo: g });
 
-    // Limpar tudo do grupo
     for (const c of Object.keys(clientes[g] ?? {})) limparCanal(g, c);
     for (const c of Object.keys(timers[g] ?? {})) cancelarTimer(g, c);
     delete clientes[g];
@@ -328,6 +365,7 @@ io.on('connection', (socket) => {
     delete historico[g];
     delete timers[g];
     delete donos[g];
+    delete ocultados[g];
 
     emitirDiretorio();
     console.log(`Admin excluiu grupo "${g}".`);
@@ -336,7 +374,7 @@ io.on('connection', (socket) => {
   // ── disconnect ───────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     console.log('Desconectou:', socket.id);
-    delete criacoesPorSocket[socket.id]; // Limpar histórico de criações
+    delete criacoesPorSocket[socket.id];
     if (grupoAtual && canalAtual && clientes[grupoAtual]?.[canalAtual]) {
       clientes[grupoAtual][canalAtual].delete(socket.id);
       emitirInfoCanal(grupoAtual, canalAtual);
