@@ -22,9 +22,13 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const GRACE_PERIOD_MS   = 5  * 60 * 1000;
-const DEBOUNCE_HIST_MS  = 10 * 1000;
-const MAX_HISTORICO     = 100;
+
+// ── Constantes de tempo ──────────────────────────────────────────────────────
+const GRACE_PERIOD_MS      = 5  * 60 * 1000;  // 5 min  — canal sem usuários
+const DEBOUNCE_HIST_MS     = 10 * 1000;        // 10 s   — debounce histórico
+const MAX_HISTORICO        = 100;
+const TEMPO_SEM_TEXTO_MS   = 10 * 1000;        // 10 s   — canal sem texto → excluir
+const TEMPO_GRUPO_VAZIO_MS = 30 * 1000;        // 30 s   — grupo sem canais → excluir
 
 // Rate limits
 const LIMITE_SOCKET_CANAIS = 20;
@@ -32,20 +36,25 @@ const JANELA_SOCKET_MS     = 5  * 60 * 1000;
 const LIMITE_GRUPO_CANAIS  = 100;
 const JANELA_GRUPO_MS      = 10 * 60 * 1000;
 
-const textos    = {};   // textos[grupo][canal] = string
-const clientes  = {};   // clientes[grupo][canal] = Set<socketId>
-const timers    = {};   // timers[grupo][canal] = timeoutId
-const historico = {};   // historico[grupo][canal] = [ISO, ...]
-const debounceHist = {};
-const donos     = {};   // donos[grupo] = socketId (admin)
-const ocultados = {};   // ocultados[grupo][canal] = true|false
+// ── Estruturas de dados ──────────────────────────────────────────────────────
+const textos       = {};  // textos[grupo][canal] = string
+const clientes     = {};  // clientes[grupo][canal] = Set<socketId>
+const timers       = {};  // timers[grupo][canal] = timeoutId (grace period)
+const historico    = {};  // historico[grupo][canal] = [ISO, ...]
+const debounceHist = {};  // debounceHist[grupo][canal] = timeoutId
+const donos        = {};  // donos[grupo] = socketId (admin)
+const ocultados    = {};  // ocultados[grupo][canal] = true|false
+
+// Novos timers de inatividade
+const timerSemTexto   = {};  // timerSemTexto[grupo][canal] = timeoutId
+const timerGrupoVazio = {};  // timerGrupoVazio[grupo] = timeoutId
 
 // Rate limiting
 const banidos           = new Set();
 const criacoesPorSocket = {};
 const criacoesPorGrupo  = {};
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function chaveRoom(grupo, canal) { return `${grupo}::${canal}`; }
 function getConectados(grupo, canal) { return clientes[grupo]?.[canal]?.size ?? 0; }
@@ -70,7 +79,7 @@ function isCanalOculto(grupo, canal) {
   return !!(ocultados[grupo]?.[canal]);
 }
 
-// ─── Admin ──────────────────────────────────────────────────────────────────
+// ── Admin ────────────────────────────────────────────────────────────────────
 
 function atribuirAdmin(grupo, socketId) {
   donos[grupo] = socketId;
@@ -88,7 +97,85 @@ function transferirAdmin(grupo, socketIdSaindo) {
   }
 }
 
-// ─── Grace period ────────────────────────────────────────────────────────────
+// ── Timers de inatividade ────────────────────────────────────────────────────
+
+function cancelarTimerSemTexto(grupo, canal) {
+  if (timerSemTexto[grupo]?.[canal]) {
+    clearTimeout(timerSemTexto[grupo][canal]);
+    delete timerSemTexto[grupo][canal];
+    if (!Object.keys(timerSemTexto[grupo]).length) delete timerSemTexto[grupo];
+  }
+}
+
+function cancelarTimerGrupoVazio(grupo) {
+  if (timerGrupoVazio[grupo]) {
+    clearTimeout(timerGrupoVazio[grupo]);
+    delete timerGrupoVazio[grupo];
+  }
+}
+
+// Canal criado sem texto por TEMPO_SEM_TEXTO_MS → excluir automaticamente
+function agendarVerificacaoTexto(grupo, canal) {
+  cancelarTimerSemTexto(grupo, canal);
+  if (!timerSemTexto[grupo]) timerSemTexto[grupo] = {};
+  timerSemTexto[grupo][canal] = setTimeout(() => {
+    cancelarTimerSemTexto(grupo, canal);
+
+    const textoAtual = textos[grupo]?.[canal];
+    if (textoAtual === undefined || !textoAtual.trim()) {
+      const canaisRestantes = getCanaisDoGrupo(grupo).filter(x => x !== canal);
+      io.to(chaveRoom(grupo, canal)).emit('canalExcluido', { grupo, canal, canaisRestantes });
+      limparCanal(grupo, canal);
+      cancelarTimer(grupo, canal);
+      emitirDiretorio();
+      agendarVerificacaoGrupoVazio(grupo);
+      console.log(`Canal "${grupo}/${canal}" auto-excluído (sem texto em ${TEMPO_SEM_TEXTO_MS / 1000}s).`);
+    }
+  }, TEMPO_SEM_TEXTO_MS);
+}
+
+// Grupo sem canais por TEMPO_GRUPO_VAZIO_MS → excluir automaticamente
+function agendarVerificacaoGrupoVazio(grupo) {
+  // Se ainda há canais ativos, cancelar qualquer timer pendente e sair
+  if (getCanaisDoGrupo(grupo).length > 0) {
+    cancelarTimerGrupoVazio(grupo);
+    return;
+  }
+
+  cancelarTimerGrupoVazio(grupo);
+  timerGrupoVazio[grupo] = setTimeout(() => {
+    delete timerGrupoVazio[grupo];
+
+    if (getCanaisDoGrupo(grupo).length > 0) return; // ganhou canais nesse intervalo
+
+    console.log(`Grupo "${grupo}" auto-excluído por inatividade (sem canais por ${TEMPO_GRUPO_VAZIO_MS / 1000}s).`);
+
+    // Notificar TODOS os clientes conectados
+    io.emit('grupoExcluido', { grupo });
+
+    // Limpar todos os dados do grupo
+    for (const c of Object.keys(clientes[grupo] ?? {})) limparCanal(grupo, c);
+    for (const c of Object.keys(timers[grupo] ?? {})) cancelarTimer(grupo, c);
+    delete clientes[grupo];
+    delete textos[grupo];
+    delete historico[grupo];
+    delete timers[grupo];
+    delete donos[grupo];
+    delete ocultados[grupo];
+    if (debounceHist[grupo]) {
+      for (const c of Object.keys(debounceHist[grupo])) clearTimeout(debounceHist[grupo][c]);
+      delete debounceHist[grupo];
+    }
+    if (timerSemTexto[grupo]) {
+      for (const c of Object.keys(timerSemTexto[grupo])) clearTimeout(timerSemTexto[grupo][c]);
+      delete timerSemTexto[grupo];
+    }
+
+    emitirDiretorio();
+  }, TEMPO_GRUPO_VAZIO_MS);
+}
+
+// ── Grace period (canal sem usuários) ────────────────────────────────────────
 
 function cancelarTimer(grupo, canal) {
   if (timers[grupo]?.[canal]) {
@@ -99,6 +186,7 @@ function cancelarTimer(grupo, canal) {
 }
 
 function limparCanal(grupo, canal) {
+  cancelarTimerSemTexto(grupo, canal);
   if (debounceHist[grupo]?.[canal]) {
     clearTimeout(debounceHist[grupo][canal]);
     delete debounceHist[grupo][canal];
@@ -110,14 +198,26 @@ function limparCanal(grupo, canal) {
       if (!Object.keys(obj[grupo]).length) delete obj[grupo];
     }
   }
-  // Limpar visibilidade do canal
   if (ocultados[grupo]) {
     delete ocultados[grupo][canal];
     if (!Object.keys(ocultados[grupo]).length) delete ocultados[grupo];
   }
 }
 
-// ─── Rate limiting ───────────────────────────────────────────────────────────
+function agendarLimpeza(grupo, canal) {
+  cancelarTimer(grupo, canal);
+  if (!timers[grupo]) timers[grupo] = {};
+  timers[grupo][canal] = setTimeout(() => {
+    if (getConectados(grupo, canal) === 0) {
+      limparCanal(grupo, canal);
+      emitirDiretorio();
+      agendarVerificacaoGrupoVazio(grupo);
+      console.log(`Canal "${grupo}/${canal}" expirou após grace period.`);
+    }
+  }, GRACE_PERIOD_MS);
+}
+
+// ── Rate limiting ─────────────────────────────────────────────────────────────
 
 function registrarCriacaoCanal(socketId, grupo, canal) {
   const agora = Date.now();
@@ -157,25 +257,14 @@ function registrarCriacaoCanal(socketId, grupo, canal) {
       cancelarTimer(grupo, cApagar);
     }
     emitirDiretorio();
+    agendarVerificacaoGrupoVazio(grupo);
     return 'spam_grupo';
   }
 
   return 'ok';
 }
 
-function agendarLimpeza(grupo, canal) {
-  cancelarTimer(grupo, canal);
-  if (!timers[grupo]) timers[grupo] = {};
-  timers[grupo][canal] = setTimeout(() => {
-    if (getConectados(grupo, canal) === 0) {
-      limparCanal(grupo, canal);
-      emitirDiretorio();
-      console.log(`Canal "${grupo}/${canal}" expirou após grace period.`);
-    }
-  }, GRACE_PERIOD_MS);
-}
-
-// ─── Histórico ───────────────────────────────────────────────────────────────
+// ── Histórico ─────────────────────────────────────────────────────────────────
 
 function registrarHistorico(grupo, canal) {
   if (!historico[grupo]) historico[grupo] = {};
@@ -195,13 +284,12 @@ function agendarHistorico(grupo, canal) {
   }, DEBOUNCE_HIST_MS);
 }
 
-// ─── Diretório personalizado por socket ──────────────────────────────────────
+// ── Diretório personalizado por socket ───────────────────────────────────────
 
 function emitirInfoCanal(grupo, canal) {
   io.to(chaveRoom(grupo, canal)).emit('canalInfo', { conectados: getConectados(grupo, canal) });
 }
 
-// Admin recebe todos os canais; não-admin recebe apenas os visíveis
 function buildDiretorioParaSocket(socketId) {
   const dir = {};
   const grupos = new Set([...Object.keys(clientes), ...Object.keys(timers)]);
@@ -220,7 +308,7 @@ function emitirDiretorio() {
   }
 }
 
-// ─── Socket ──────────────────────────────────────────────────────────────────
+// ── Socket ───────────────────────────────────────────────────────────────────
 
 io.on('connection', (socket) => {
   console.log('Conectou:', socket.id);
@@ -228,7 +316,6 @@ io.on('connection', (socket) => {
   let grupoAtual = null;
   let canalAtual = null;
 
-  // Diretório personalizado no momento da conexão
   socket.emit('diretorioAtualizado', buildDiretorioParaSocket(socket.id));
 
   // ── joinCanal ────────────────────────────────────────────────────────────
@@ -258,9 +345,14 @@ io.on('connection', (socket) => {
       emitirDiretorio();
     }
 
+    // Cancelar timer de grupo vazio (atividade detectada no grupo)
+    cancelarTimerGrupoVazio(g);
+
     if (canalNovo) {
       const resultado = registrarCriacaoCanal(socket.id, g, c);
       if (resultado === 'banido' || resultado === 'spam_grupo') return;
+      // Canal novo: iniciar timer — deve receber texto em TEMPO_SEM_TEXTO_MS ou é excluído
+      agendarVerificacaoTexto(g, c);
     }
 
     grupoAtual = g;
@@ -285,7 +377,7 @@ io.on('connection', (socket) => {
       socket.emit('adminStatus', { isAdmin: false, grupo: g });
     }
 
-    // Sincronizar estado de visibilidade dos canais do grupo para quem entrou
+    // Sincronizar estado de visibilidade dos canais do grupo
     if (ocultados[g]) {
       for (const [c2, oculto] of Object.entries(ocultados[g])) {
         if (oculto) socket.emit('visibilidadeCanal', { grupo: g, canal: c2, oculto: true });
@@ -303,6 +395,10 @@ io.on('connection', (socket) => {
 
     if (!textos[g]) textos[g] = {};
     textos[g][c] = texto;
+
+    // Canal recebeu texto: cancelar o timer de "sem texto"
+    if (texto && texto.trim()) cancelarTimerSemTexto(g, c);
+
     socket.to(chaveRoom(g, c)).emit('update', texto);
     io.emit('canalAtualizado', { grupo: g, canal: c });
     agendarHistorico(g, c);
@@ -313,18 +409,16 @@ io.on('connection', (socket) => {
     if (typeof grupo !== 'string' || typeof canal !== 'string') return;
     const g = grupo.trim(), c = canal.trim();
     if (!g || !c) return;
-    if (donos[g] !== socket.id) return; // somente admin
+    if (donos[g] !== socket.id) return;
 
     if (!ocultados[g]) ocultados[g] = {};
     ocultados[g][c] = !ocultados[g][c];
     const oculto = !!ocultados[g][c];
 
-    // Notificar todos os sockets conectados ao grupo
     for (const canalGrupo of Object.keys(clientes[g] ?? {})) {
       io.to(chaveRoom(g, canalGrupo)).emit('visibilidadeCanal', { grupo: g, canal: c, oculto });
     }
 
-    // Atualizar diretório personalizado (não-admin não vê mais o canal oculto)
     emitirDiretorio();
     console.log(`Admin ${oculto ? 'ocultou' : 'exibiu'} canal "${g}/${c}"`);
   });
@@ -342,6 +436,7 @@ io.on('connection', (socket) => {
     limparCanal(g, c);
     cancelarTimer(g, c);
     emitirDiretorio();
+    agendarVerificacaoGrupoVazio(g);
     console.log(`Admin excluiu canal "${g}/${c}". Restantes: [${canaisRestantes}]`);
   });
 
@@ -352,10 +447,7 @@ io.on('connection', (socket) => {
     if (!g) return;
     if (donos[g] !== socket.id) return;
 
-    // Notificar TODOS os sockets conectados — não apenas os que estão em rooms do grupo.
-    // Sockets que tinham o grupo selecionado no combobox (sem estar numa room) também
-    // precisam receber o evento para limpar o estado, caso contrário ao interagirem
-    // entrariam no grupo deletado e virariam admin.
+    cancelarTimerGrupoVazio(g);
     io.emit('grupoExcluido', { grupo: g });
 
     for (const c of Object.keys(clientes[g] ?? {})) limparCanal(g, c);
