@@ -22,69 +22,139 @@ app.use((req, res, next) => {
   next();
 });
 
-
 const PORT = process.env.PORT || 3000;
 
-// Texto atual por canal
-const textosPorCanal = {};
+// Estrutura: textos[grupo][canal] = string
+const textos = {};
 
-// Contagem de clientes por canal
-const clientesPorCanal = {};
+// Estrutura: clientes[grupo][canal] = Set<socketId>
+const clientes = {};
 
-function emitirInfoCanal(canal) {
-  const conectados = clientesPorCanal[canal] ? clientesPorCanal[canal].size : 0;
-  io.to(canal).emit('canalInfo', { conectados });
+function chaveRoom(grupo, canal) {
+  return `${grupo}::${canal}`;
+}
+
+function getConectados(grupo, canal) {
+  return clientes[grupo]?.[canal]?.size ?? 0;
+}
+
+function limparCanalSeVazio(grupo, canal) {
+  if (getConectados(grupo, canal) === 0) {
+    // Apaga texto e entrada do canal
+    if (clientes[grupo]) {
+      delete clientes[grupo][canal];
+      if (Object.keys(clientes[grupo]).length === 0) {
+        delete clientes[grupo];
+      }
+    }
+    if (textos[grupo]) {
+      delete textos[grupo][canal];
+      if (Object.keys(textos[grupo]).length === 0) {
+        delete textos[grupo];
+      }
+    }
+  }
+}
+
+function emitirInfoCanal(grupo, canal) {
+  const conectados = getConectados(grupo, canal);
+  io.to(chaveRoom(grupo, canal)).emit('canalInfo', { conectados });
+}
+
+function buildDiretorio() {
+  const dir = {};
+  for (const grupo of Object.keys(clientes)) {
+    const canais = Object.keys(clientes[grupo]).filter(
+      (canal) => (clientes[grupo][canal]?.size ?? 0) > 0
+    );
+    if (canais.length > 0) {
+      dir[grupo] = canais;
+    }
+  }
+  return dir;
+}
+
+function emitirDiretorio() {
+  io.emit('diretorioAtualizado', buildDiretorio());
 }
 
 io.on('connection', (socket) => {
   console.log('Um cliente se conectou:', socket.id);
 
+  let grupoAtual = null;
   let canalAtual = null;
 
-  // Cliente entra em um canal
-  socket.on('joinCanal', (canal) => {
+  // Enviar diretório atual ao conectar
+  socket.emit('diretorioAtualizado', buildDiretorio());
+
+  // Cliente entra em um canal de um grupo
+  socket.on('joinCanal', ({ grupo, canal }) => {
+    if (!grupo || typeof grupo !== 'string') return;
     if (!canal || typeof canal !== 'string') return;
 
+    const grupoTrim = grupo.trim();
+    const canalTrim = canal.trim();
+    if (!grupoTrim || !canalTrim) return;
+
     // Sair do canal anterior
-    if (canalAtual) {
-      socket.leave(canalAtual);
-      if (clientesPorCanal[canalAtual]) {
-        clientesPorCanal[canalAtual].delete(socket.id);
-        emitirInfoCanal(canalAtual);
+    if (grupoAtual && canalAtual) {
+      socket.leave(chaveRoom(grupoAtual, canalAtual));
+      if (clientes[grupoAtual]?.[canalAtual]) {
+        clientes[grupoAtual][canalAtual].delete(socket.id);
+        emitirInfoCanal(grupoAtual, canalAtual);
+        limparCanalSeVazio(grupoAtual, canalAtual);
+        emitirDiretorio();
       }
     }
 
-    canalAtual = canal.trim();
-    socket.join(canalAtual);
+    grupoAtual = grupoTrim;
+    canalAtual = canalTrim;
 
-    if (!clientesPorCanal[canalAtual]) {
-      clientesPorCanal[canalAtual] = new Set();
-    }
-    clientesPorCanal[canalAtual].add(socket.id);
+    const room = chaveRoom(grupoAtual, canalAtual);
+    socket.join(room);
 
-    // Enviar texto atual do canal para o cliente que entrou
-    socket.emit('update', textosPorCanal[canalAtual] || '');
+    if (!clientes[grupoAtual]) clientes[grupoAtual] = {};
+    if (!clientes[grupoAtual][canalAtual]) clientes[grupoAtual][canalAtual] = new Set();
+    clientes[grupoAtual][canalAtual].add(socket.id);
 
-    // Notificar todos no canal sobre nova contagem
-    emitirInfoCanal(canalAtual);
+    // Enviar texto atual do canal
+    const textoAtual = textos[grupoAtual]?.[canalAtual] ?? '';
+    socket.emit('update', textoAtual);
 
-    console.log(`Cliente ${socket.id} entrou no canal "${canalAtual}" (${clientesPorCanal[canalAtual].size} conectado(s))`);
+    // Notificar todos no canal
+    emitirInfoCanal(grupoAtual, canalAtual);
+
+    // Atualizar diretório para todos
+    emitirDiretorio();
+
+    console.log(`Cliente ${socket.id} entrou em "${grupoAtual}/${canalAtual}" (${clientes[grupoAtual][canalAtual].size} conectado(s))`);
   });
 
-  // Receber atualização de texto do cliente
-  socket.on('updateTextoGlobal', ({ canal, texto }) => {
+  // Receber atualização de texto
+  socket.on('updateTextoGlobal', ({ grupo, canal, texto }) => {
+    if (!grupo || typeof grupo !== 'string') return;
     if (!canal || typeof canal !== 'string') return;
-    textosPorCanal[canal.trim()] = texto;
-    // Transmitir para todos no canal, exceto o remetente
-    socket.to(canal.trim()).emit('update', texto);
+
+    const grupoTrim = grupo.trim();
+    const canalTrim = canal.trim();
+    if (!grupoTrim || !canalTrim) return;
+
+    if (!textos[grupoTrim]) textos[grupoTrim] = {};
+    textos[grupoTrim][canalTrim] = texto;
+
+    socket.to(chaveRoom(grupoTrim, canalTrim)).emit('update', texto);
   });
 
   socket.on('disconnect', () => {
     console.log('Um cliente se desconectou:', socket.id);
-    if (canalAtual && clientesPorCanal[canalAtual]) {
-      clientesPorCanal[canalAtual].delete(socket.id);
-      emitirInfoCanal(canalAtual);
-      console.log(`Canal "${canalAtual}" agora tem ${clientesPorCanal[canalAtual].size} conectado(s)`);
+    if (grupoAtual && canalAtual) {
+      if (clientes[grupoAtual]?.[canalAtual]) {
+        clientes[grupoAtual][canalAtual].delete(socket.id);
+        emitirInfoCanal(grupoAtual, canalAtual);
+        limparCanalSeVazio(grupoAtual, canalAtual);
+        emitirDiretorio();
+        console.log(`Canal "${grupoAtual}/${canalAtual}" agora tem ${getConectados(grupoAtual, canalAtual)} conectado(s)`);
+      }
     }
   });
 });
